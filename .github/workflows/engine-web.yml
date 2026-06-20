@@ -1,0 +1,317 @@
+name: Build APK (Web)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'Link direto da Source Code (.zip) — enviado pelo site'
+        required: true
+        type: string
+      zip_password:
+        description: 'Senha do arquivo ZIP (se houver)'
+        required: false
+        type: string
+      session_id:
+        description: 'ID da sessão do site para callback de progresso'
+        required: true
+        type: string
+      callback_url:
+        description: 'URL do site para receber atualizações de progresso'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 0. Notificar início
+      - name: Notificar Início
+        run: |
+          curl -s -X POST "${{ github.event.inputs.callback_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "session_id": "${{ github.event.inputs.session_id }}",
+              "step": 1,
+              "status": "running",
+              "message": "Baixando e extraindo Source Code..."
+            }' || true
+
+      # 1. Download e extração da Source Code
+      - name: Baixar e Extrair Source Code
+        run: |
+          INPUT_URL="${{ github.event.inputs.zip_url }}"
+          ZIP_PASSWORD="${{ github.event.inputs.zip_password }}"
+          USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+          if [[ "$INPUT_URL" == *"mediafire.com"* ]]; then
+            echo "[MediaFire] Detectado. Extraindo link direto..."
+            HTML_CONTENT=$(curl -sL -A "$USER_AGENT" "$INPUT_URL")
+            REAL_URL=$(echo "$HTML_CONTENT" | grep -oE 'https://download[^"]+\.zip' | head -n 1)
+            if [ -z "$REAL_URL" ]; then
+              REAL_URL=$(echo "$HTML_CONTENT" | grep -oE 'href="https://[^"]+static\.mediafire\.com[^"]+"' | head -n 1 | cut -d'"' -f2)
+            fi
+          else
+            REAL_URL="$INPUT_URL"
+          fi
+
+          if [ -z "$REAL_URL" ]; then
+            echo "::error::Não foi possível extrair o link de download."
+            exit 1
+          fi
+
+          echo "Baixando de: $REAL_URL"
+          if ! curl -f -L -A "$USER_AGENT" -o source.zip "$REAL_URL"; then
+            echo "::error::Falha no download do arquivo."
+            exit 1
+          fi
+
+          if [ -n "$ZIP_PASSWORD" ]; then
+            if ! unzip -P "$ZIP_PASSWORD" -t source.zip > /dev/null 2>&1; then
+              echo "::error::Senha incorreta ou arquivo corrompido."
+              exit 1
+            fi
+            mkdir -p temp_extract
+            unzip -P "$ZIP_PASSWORD" -q source.zip -d temp_extract
+          else
+            if ! unzip -t source.zip > /dev/null 2>&1; then
+              echo "::error::Arquivo ZIP inválido ou corrompido."
+              exit 1
+            fi
+            mkdir -p temp_extract
+            unzip -q source.zip -d temp_extract
+          fi
+
+          CANDIDATES=$(find temp_extract -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+          PROJECT_ROOT=""
+          BEST_DEPTH=9999
+          BEST_TYPE=4
+
+          while read -r file; do
+            [ -z "$file" ] && continue
+            dir=$(dirname "$file")
+            temp_dir="${dir//[^\/]/}"
+            depth="${#temp_dir}"
+            filename=$(basename "$file")
+            type_weight=3
+            if [[ "$filename" == "settings.gradle"* ]]; then type_weight=1
+            elif [[ "$filename" == "gradlew" ]]; then type_weight=2
+            fi
+            if [ "$depth" -lt "$BEST_DEPTH" ]; then
+              BEST_DEPTH=$depth; BEST_TYPE=$type_weight; PROJECT_ROOT=$dir
+            elif [ "$depth" -eq "$BEST_DEPTH" ] && [ "$type_weight" -lt "$BEST_TYPE" ]; then
+              BEST_TYPE=$type_weight; PROJECT_ROOT=$dir
+            fi
+          done <<< "$CANDIDATES"
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::Nenhum projeto Gradle encontrado no ZIP."
+            exit 1
+          fi
+
+          shopt -s dotglob
+          mv "$PROJECT_ROOT"/* . 2>/dev/null || true
+          shopt -u dotglob
+          chmod +x ./gradlew 2>/dev/null || true
+          rm -rf temp_extract source.zip
+          echo "Source Code configurada com sucesso."
+
+      # 2. Notificar SDK
+      - name: Notificar Configurando SDK
+        if: success()
+        run: |
+          curl -s -X POST "${{ github.event.inputs.callback_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "session_id": "${{ github.event.inputs.session_id }}",
+              "step": 2,
+              "status": "running",
+              "message": "Configurando Java e Android SDK..."
+            }' || true
+
+      # 3. Configurar JDK 17
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 4. Configurar Android SDK
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 5. Cache do Gradle
+      - name: Setup Gradle Cache
+        uses: gradle/actions/setup-gradle@v3
+
+      # 6. Cache C/C++ NDK
+      - name: Cache C/C++ Build (NDK)
+        uses: actions/cache@v4
+        with:
+          path: '**/.cxx'
+          key: ndk-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ndk-cache-${{ runner.os }}-
+
+      # 7. Notificar Compilando
+      - name: Notificar Compilando APK
+        if: success()
+        run: |
+          curl -s -X POST "${{ github.event.inputs.callback_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "session_id": "${{ github.event.inputs.session_id }}",
+              "step": 3,
+              "status": "running",
+              "message": "Compilando APK (pode levar 5 a 15 minutos)..."
+            }' || true
+
+      # 8. Compilar APK
+      - name: Compilar APK (Debug)
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: |
+          PROJECT_DIR=$(pwd)
+
+          if [ ! -f "./gradlew" ]; then
+            GRADLE_VERSION="8.7"
+            if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+              DETECTED=$(grep "distributionUrl" gradle/wrapper/gradle-wrapper.properties | grep -oE "gradle-[0-9]+\.[0-9]+(\.[0-9]+)?-" | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -n 1)
+              [ -n "$DETECTED" ] && GRADLE_VERSION="$DETECTED"
+            fi
+            TMPDIR=$(mktemp -d)
+            cd "$TMPDIR"
+            touch settings.gradle
+            gradle wrapper --gradle-version "$GRADLE_VERSION"
+            cp gradlew "$PROJECT_DIR/gradlew"
+            cp -r gradle "$PROJECT_DIR/"
+            cd "$PROJECT_DIR"
+            chmod +x ./gradlew
+          else
+            chmod +x ./gradlew
+          fi
+
+          ./gradlew assembleDebug 2>&1 | tee build.log
+
+      # 9. Extrair erros se falhou
+      - name: Extrair Erros
+        if: failure()
+        run: |
+          python3 scripts/parse_errors.py
+          echo "ERROR_DETAILS<<EOF" >> $GITHUB_ENV
+          cat error_details.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # 10. Notificar Fazendo Upload
+      - name: Notificar Fazendo Upload
+        if: success()
+        run: |
+          curl -s -X POST "${{ github.event.inputs.callback_url }}/api/progress" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "session_id": "${{ github.event.inputs.session_id }}",
+              "step": 4,
+              "status": "running",
+              "message": "Compilação concluída! Fazendo upload do APK..."
+            }' || true
+
+      # 11. Salvar APK como artifact do GitHub
+      - name: Upload Artifact GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: Launcher-APK
+          path: '**/*.apk'
+          if-no-files-found: error
+
+      # 12. Upload para link direto
+      - name: Upload do APK para Link Direto
+        id: upload_direto
+        if: success()
+        run: |
+          APK_FILE=$(find . -name "*.apk" | head -n 1)
+          if [ -n "$APK_FILE" ]; then
+            DOWNLOAD_LINK=""
+
+            echo "Tentando transfer.sh..."
+            DOWNLOAD_LINK=$(curl -s --upload-file "$APK_FILE" "https://transfer.sh/$(basename $APK_FILE)" || echo "")
+            echo "transfer.sh: $DOWNLOAD_LINK"
+
+            if [ -z "$DOWNLOAD_LINK" ] || [[ "$DOWNLOAD_LINK" != http* ]]; then
+              echo "Tentando catbox.moe..."
+              DOWNLOAD_LINK=$(curl -s -F "reqtype=fileupload" -F "fileToUpload=@$APK_FILE" "https://catbox.moe/user/api.php" || echo "")
+              echo "catbox.moe: $DOWNLOAD_LINK"
+            fi
+
+            if [ -z "$DOWNLOAD_LINK" ] || [[ "$DOWNLOAD_LINK" != http* ]]; then
+              echo "Tentando gofile.io..."
+              SERVER=$(curl -s "https://api.gofile.io/servers" | python3 -c "import sys,json; d=sys.stdin.read(); print(json.loads(d).get('data',{}).get('servers',[{'name':'store1'}])[0]['name']) if d else print('store1')" 2>/dev/null || echo "store1")
+              RESPONSE=$(curl -s -F "file=@$APK_FILE" "https://${SERVER}.gofile.io/contents/uploadfile" || echo "")
+              DOWNLOAD_LINK=$(echo "$RESPONSE" | python3 -c "import sys,json; d=sys.stdin.read(); print(json.loads(d).get('data',{}).get('downloadPage','')) if d else print('')" 2>/dev/null || echo "")
+              echo "gofile.io: $DOWNLOAD_LINK"
+            fi
+
+            if [ -z "$DOWNLOAD_LINK" ] || [[ "$DOWNLOAD_LINK" != http* ]]; then
+              echo "Tentando bashupload.com..."
+              DOWNLOAD_LINK=$(curl -s --upload-file "$APK_FILE" "https://bashupload.com/$(basename $APK_FILE)" || echo "")
+              echo "bashupload.com: $DOWNLOAD_LINK"
+            fi
+
+            if [ -z "$DOWNLOAD_LINK" ] || [[ "$DOWNLOAD_LINK" != http* ]]; then
+              echo "DOWNLOAD_URL=UPLOAD_FALHOU" >> $GITHUB_ENV
+            else
+              echo "Upload concluído: $DOWNLOAD_LINK"
+              echo "DOWNLOAD_URL=$DOWNLOAD_LINK" >> $GITHUB_ENV
+            fi
+          else
+            echo "DOWNLOAD_URL=NENHUM_APK_GERADO" >> $GITHUB_ENV
+          fi
+
+      # 13. Callback final para o site
+      - name: Callback Final para o Site
+        if: always()
+        env:
+          DOWNLOAD_URL: ${{ env.DOWNLOAD_URL }}
+          ERROR_DETAILS: ${{ env.ERROR_DETAILS }}
+        run: |
+          python3 -c '
+          import json, os, urllib.request
+
+          status = "${{ job.status }}"
+          download_url = os.environ.get("DOWNLOAD_URL", "")
+          error_details = os.environ.get("ERROR_DETAILS", "").replace("\\n", "\n")
+          repo = "${{ github.repository }}"
+          run_id = "${{ github.run_id }}"
+          callback_url = "${{ github.event.inputs.callback_url }}"
+          session_id = "${{ github.event.inputs.session_id }}"
+
+          if status == "success":
+            payload = {
+              "session_id": session_id,
+              "step": 4,
+              "status": "success",
+              "message": "APK compilado com sucesso!",
+              "download_url": download_url
+            }
+          else:
+            payload = {
+              "session_id": session_id,
+              "step": 3,
+              "status": "error",
+              "message": "Falha na compilação.",
+              "error_details": error_details,
+              "run_url": f"https://github.com/{repo}/actions/runs/{run_id}"
+            }
+
+          data = json.dumps(payload).encode("utf-8")
+          req = urllib.request.Request(
+            f"{callback_url}/api/progress",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+          )
+          try:
+            urllib.request.urlopen(req, timeout=10)
+          except Exception as e:
+            print(f"Erro ao enviar callback: {e}")
+          '
